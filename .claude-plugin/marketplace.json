@@ -1,0 +1,5 @@
+{
+  "name": "bg-watch",
+  "owner": { "name": "hmj1026" },
+  "plugins": [{ "name": "bg-watch", "source": "./" }]
+}

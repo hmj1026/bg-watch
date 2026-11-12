@@ -1,0 +1,6 @@
+{
+  "name": "bg-watch",
+  "version": "0.1.0",
+  "description": "Live progress of background Bash commands and the actual model@effort of each subagent, in a pane and the status line",
+  "types": "./types/index.d.ts"
+}
