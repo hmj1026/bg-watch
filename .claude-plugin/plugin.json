@@ -1,6 +1,38 @@
 {
   "name": "bg-watch",
-  "version": "0.1.0",
-  "description": "Live progress of background Bash commands and the actual model@effort of each subagent, in a pane and the status line",
-  "types": "./types/index.d.ts"
+  "version": "0.3.0",
+  "description": "Live progress of background Bash commands, Monitors and Workflows, and the actual model@effort, tokens and cost of each subagent, in a pane, the transcript and the status line",
+  "types": "./types/index.d.ts",
+  "userConfig": {
+    "finishedTtlSec": {
+      "type": "number",
+      "title": "Keep finished rows (seconds)",
+      "description": "How long a finished job or idle subagent row stays in the pane before it leaves on its own",
+      "default": 180
+    },
+    "quietCheckSec": {
+      "type": "number",
+      "title": "Exit check after quiet (seconds)",
+      "description": "Output quiet this long: check with lsof whether a background Bash command has exited without a notification",
+      "default": 10
+    },
+    "staleSec": {
+      "type": "number",
+      "title": "Quiet warning after (seconds)",
+      "description": "Show (quiet …) on a running job whose output has not grown for this long",
+      "default": 60
+    },
+    "notifyAfterSec": {
+      "type": "number",
+      "title": "OS notification after (seconds)",
+      "description": "Send a system notification when a job that ran at least this long ends; 0 turns it off",
+      "default": 120
+    },
+    "statusLine": {
+      "type": "boolean",
+      "title": "Status line",
+      "description": "Show the running jobs in the status line",
+      "default": true
+    }
+  }
 }
