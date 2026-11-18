@@ -1,0 +1,17 @@
+# Typings Claude Code writes beside a mod it loads (claude-code, claude-code-tools,
+# claude-code-mcp, tsconfig.json); tsconfig.json extends them. Regenerated per build.
+.claude-plugin/types/
+
+# Local Claude Code session state and tooling artifacts
+.claude/
+
+# Dependencies and tool caches (npx tsc, editors)
+node_modules/
+*.tsbuildinfo
+
+# OS and editor files
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*.log
