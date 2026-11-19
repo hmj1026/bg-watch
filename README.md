@@ -152,6 +152,10 @@ claude plugin marketplace update bg-watch
 claude plugin update bg-watch@bg-watch
 ```
 
+If either command says `Marketplace 'bg-watch' not found` or `Plugin "bg-watch" not found`, this machine never
+added the marketplace or installed the plugin (a `--plugin-dir` session doesn't count). Run the two commands
+under Install instead.
+
 Inside a session, `/plugin` opens the same marketplace and plugin manager. `claude plugin list` shows the
 installed version.
 

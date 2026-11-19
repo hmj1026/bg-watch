@@ -150,6 +150,9 @@ claude plugin marketplace update bg-watch
 claude plugin update bg-watch@bg-watch
 ```
 
+如果出現 `Marketplace 'bg-watch' not found` 或 `Plugin "bg-watch" not found`，代表這台電腦還沒加入
+marketplace 或還沒安裝 plugin（用 `--plugin-dir` 載入不算安裝），請改用「安裝」一節的兩行指令。
+
 在 session 中輸入 `/plugin` 也能開啟同樣的 marketplace 與 plugin 管理介面。`claude plugin list`
 可查看目前安裝的版本。
 
