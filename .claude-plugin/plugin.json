@@ -1,6 +1,6 @@
 {
   "name": "bg-watch",
-  "version": "0.4.0",
+  "version": "0.4.1",
   "description": "Live progress of background Bash commands, Monitors and Workflows, and the actual model@effort, tokens and cost of each subagent, in a clickable band above the prompt, a pane and the transcript",
   "types": "./types/index.d.ts",
   "userConfig": {
