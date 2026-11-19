@@ -25,7 +25,8 @@ export type Job = {
    * `running` until the end is known: the notification's word
    * (`completed`, `failed`, `killed`, `stopped`), `ended` when bg-watch saw the
    * output file released with no notification (exit code unknown), `expired`
-   * for a Monitor past its deadline.
+   * for a Monitor past its deadline, `unknown` for a Bash job whose output file
+   * never turned up: not counted as running, still endable by a notification.
    */
   status: JobStatus
   /** The exit code a notification stated (`failed with exit code 1`). */
@@ -54,13 +55,32 @@ export type AgentRow = {
   steps: number
   firstAt: number
   lastAt: number
+  /** The agent type, kept from the roster so a finished agent keeps its name. */
+  type?: string
+  /** The task it was given, kept from the roster. */
+  description?: string
+  /** Output tokens and cost as the roster last stated them. */
+  outTokens?: number
+  costUsd?: number
 }
+
+/** Finished rows that left the lists (`[clear]`, expiry), so the totals outlive them. */
+export type Tally = { completed: number; failed: number; stopped: number; agents: number }
+
+/** What the person opened and closed in the pane: row ids and section ids. */
+export type ViewState = { expanded: string[]; collapsed: string[] }
 
 declare module 'claude-code' {
   interface PluginState {
     'bg-watch': {
       jobs: Shaped<Job[]>
       agents: Shaped<AgentRow[]>
+      /** Finished rows no longer listed, counted. */
+      tally: Shaped<Tally>
+      /** Expanded rows and collapsed sections. */
+      view: Shaped<ViewState>
+      /** Whether the pane is open, for the band's [open]/[close]. */
+      paneOpen: boolean
       /** Bumped each poll while a job runs, so the pane's elapsed times move. */
       tick: number
     }

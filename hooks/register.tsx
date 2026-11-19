@@ -1,8 +1,11 @@
 import { atom, read, update } from 'claude-code'
-import type { EngineInterface, PluginOptions, Register } from 'claude-code'
+import type { AgentInfo, EngineInterface, PluginOptions, Register } from 'claude-code'
 
-import type { AgentRow, Job, JobKind } from '../types'
-import { clip, elapsed, notificationOf, outputPathOf, readPiece, tasksDirOf, tokens } from './parse'
+import type { AgentRow, Job, Tally } from '../types'
+import { EMPTY_TALLY, focusJob, isDone, isFinishedAgentStatus, isLive, jobFigures, mark, nameOf, tallyOf, totalsOf } from './layout'
+import { clip, elapsed, notificationOf, outputPathOf, readPiece, tasksDirOf } from './parse'
+import { DEFAULT_VIEW, bandRow, paneBody } from './view'
+import type { Actions, Snapshot } from './view'
 
 type BashBackground = {
   stdout?: string
@@ -11,6 +14,8 @@ type BashBackground = {
 }
 
 const PANE = 'bg-watch'
+/** The dock width asked for on open; a width the person dragged wins. */
+const PANE_COLUMNS = 60
 const POLL_MS = 3000
 const KEEP_JOBS = 20
 const KEEP_AGENTS = 40
@@ -22,6 +27,8 @@ const MISSING_GRACE_MS = 30_000
 const DEADLINE_GRACE_MS = 30_000
 /** Most bytes read from an output file in one poll (the newest ones). */
 const READ_MAX = 256 * 1024
+/** A failure this recent still counts on the band while others run. */
+const RECENT_FAIL_MS = 300_000
 
 /** The `userConfig` fields, as numbers in milliseconds where they are times. */
 type Config = {
@@ -30,55 +37,51 @@ type Config = {
   staleMs: number
   notifyAfterMs: number
   statusLine: boolean
+  band: boolean
 }
 
 const DEFAULTS: Config = {
-  finishedTtlMs: 180_000,
+  finishedTtlMs: 1_800_000,
   quietCheckMs: 10_000,
   staleMs: 60_000,
   notifyAfterMs: 120_000,
-  statusLine: true,
+  statusLine: false,
+  band: true,
 }
 
 const seconds = (value: unknown, fallback: number) =>
   typeof value === 'number' && Number.isFinite(value) && value >= 0 ? value * 1000 : fallback
+
+const flag = (value: unknown, fallback: boolean) => (typeof value === 'boolean' ? value : fallback)
 
 const configOf = (options: PluginOptions | undefined): Config => ({
   finishedTtlMs: seconds(options?.finishedTtlSec, DEFAULTS.finishedTtlMs),
   quietCheckMs: seconds(options?.quietCheckSec, DEFAULTS.quietCheckMs),
   staleMs: seconds(options?.staleSec, DEFAULTS.staleMs),
   notifyAfterMs: seconds(options?.notifyAfterSec, DEFAULTS.notifyAfterMs),
-  statusLine: typeof options?.statusLine === 'boolean' ? options.statusLine : DEFAULTS.statusLine,
+  statusLine: flag(options?.statusLine, DEFAULTS.statusLine),
+  band: flag(options?.band, DEFAULTS.band),
 })
 
 // Bump a tag when that value's fields change: it declines what an earlier
 // version stored, which outlives a reload.
 const jobs = atom({ plugin: 'bg-watch', key: 'jobs' } as const, [], { shape: 'jobs-3' })
-const agents = atom({ plugin: 'bg-watch', key: 'agents' } as const, [], {
-  shape: 'agents-1',
-})
+const agents = atom({ plugin: 'bg-watch', key: 'agents' } as const, [], { shape: 'agents-2' })
+const tally = atom({ plugin: 'bg-watch', key: 'tally' } as const, EMPTY_TALLY, { shape: 'tally-1' })
+const view = atom({ plugin: 'bg-watch', key: 'view' } as const, DEFAULT_VIEW, { shape: 'view-1' })
+const paneOpen = atom({ plugin: 'bg-watch', key: 'paneOpen' } as const, false)
 const tick = atom({ plugin: 'bg-watch', key: 'tick' } as const, 0)
-
-const shortModel = (model: string) => model.replace(/^claude-/, '')
-
-const isDone = (job: Job) => job.status !== 'running'
-
-const mark = (status: string) =>
-  status === 'running'
-    ? '▶'
-    : status === 'completed'
-      ? '✓'
-      : status === 'ended' || status === 'expired' || status === 'stopped'
-        ? '■'
-        : '✗'
-
-const KIND_TAG: Record<JobKind, string> = { bash: '', monitor: '[mon] ', workflow: '[wf] ' }
-
-const titleOf = (job: Job) => `${KIND_TAG[job.kind] ?? ''}${job.description || job.command}`
 
 /** `failed (exit 1)`, `completed`, … */
 const outcomeOf = (job: Job) =>
   job.exitCode !== undefined && job.exitCode !== 0 ? `${job.status} (exit ${job.exitCode})` : job.status
+
+const addTally = (base: Tally, more: Tally): Tally => ({
+  completed: base.completed + more.completed,
+  failed: base.failed + more.failed,
+  stopped: base.stopped + more.stopped,
+  agents: base.agents + more.agents,
+})
 
 // Module memory, lost on reload (which only costs one early check or a
 // later notice): settings, when each quiet job was last asked about, whether
@@ -119,7 +122,7 @@ async function endJob(
   await update($, jobs, all =>
     all.map(job => {
       if (job.id !== id) return job
-      if (job.status === 'running') {
+      if (!isDone(job)) {
         ended = { ...job, status, endedAt: now, path: job.path || extra.path || '', exitCode: extra.exitCode }
         return ended
       }
@@ -130,7 +133,7 @@ async function endJob(
   releaseCheckedAt.delete(id)
   if (!ended) return
   const ran = now - ended.startedAt
-  const text = `${mark(ended.status)} ${clip(titleOf(ended), 50)} ${outcomeOf(ended)} (${elapsed(ran)})`
+  const text = `${mark(ended.status)} ${clip(nameOf(ended), 50)} ${outcomeOf(ended)} (${elapsed(ran)})`
   $.ui.toast(text)
   if (config.notifyAfterMs > 0 && ran >= config.notifyAfterMs) {
     await $.ui
@@ -148,6 +151,29 @@ async function stopJob($: EngineInterface, id: string) {
     return
   }
   await endJob($, id, 'killed')
+}
+
+/** Agent ids the roster still holds alive (running, waiting, idle). */
+async function liveAgentIds($: EngineInterface) {
+  const roster = await $.agent.list().catch(() => [] as AgentInfo[])
+  return new Set(roster.filter(one => !isFinishedAgentStatus(one.status)).map(one => one.id))
+}
+
+/** Drops finished jobs and agent rows, keeping their count in the tally. */
+async function clearFinished($: EngineInterface) {
+  const live = await liveAgentIds($)
+  let droppedJobs: Job[] = []
+  await update($, jobs, all => {
+    droppedJobs = all.filter(isDone)
+    return all.filter(isLive)
+  })
+  let droppedAgents = 0
+  await update($, agents, all => {
+    droppedAgents = all.filter(row => row.id !== 'main' && !live.has(row.id)).length
+    return all.filter(row => row.id === 'main' || live.has(row.id))
+  })
+  await update($, tally, base => tallyOf(base, droppedJobs, droppedAgents))
+  await showStatus($)
 }
 
 /** Reads what a running job's output file gained since the last poll. */
@@ -175,20 +201,24 @@ async function readGrowth($: EngineInterface, job: Job, size: number, now: numbe
   } satisfies Partial<Job>
 }
 
-/** One poll: read new output, notice exits, drop rows past their time. */
-async function poll($: EngineInterface) {
-  const list = await read($, jobs)
-  const now = await $.clock.now()
+/** Reads running jobs' output and returns those that ended without a notification. */
+async function scanJobs($: EngineInterface, list: readonly Job[], now: number) {
   const seen = new Map<string, Partial<Job>>()
   const gone: { id: string; status: string }[] = []
 
   for (const job of list) {
+    // A job never seen to start writing ends after the finished-row time.
+    if (job.status === 'unknown' && now - job.startedAt > config.finishedTtlMs) gone.push({ id: job.id, status: 'ended' })
     if (job.status !== 'running') continue
     if (job.deadline !== undefined && now > job.deadline + DEADLINE_GRACE_MS) {
       gone.push({ id: job.id, status: 'expired' })
       continue
     }
-    if (!job.path) continue
+    if (!job.path) {
+      // A Bash job whose output file never turned up: not counted as running.
+      if (job.kind === 'bash' && now - job.startedAt > config.staleMs) seen.set(job.id, { status: 'unknown' })
+      continue
+    }
     let size: number
     try {
       size = (await $.fs.stat(job.path)).size
@@ -215,6 +245,51 @@ async function poll($: EngineInterface) {
     releaseCheckedAt.set(job.id, now)
     if (await released($, job.path)) gone.push({ id: job.id, status: 'ended' })
   }
+  return { seen, gone }
+}
+
+/** Keeps each subagent's name, task, tokens and cost from the roster, so they outlive it. */
+const enrich = (row: AgentRow, one: AgentInfo | undefined): AgentRow => {
+  if (!one) return row
+  const out = (one.usage ?? []).reduce((n, u) => n + u.output_tokens, 0)
+  const next = {
+    ...row,
+    type: one.type ?? row.type,
+    description: one.description ?? row.description,
+    outTokens: out > 0 ? out : row.outTokens,
+    costUsd: one.cost?.usd ?? row.costUsd,
+  }
+  const same =
+    next.type === row.type &&
+    next.description === row.description &&
+    next.outTokens === row.outTokens &&
+    next.costUsd === row.costUsd
+  return same ? row : next
+}
+
+/** Agent rows: kept up to date from the roster; finished ones past their time leave. */
+async function sweepAgents($: EngineInterface, now: number) {
+  const agentList = await read($, agents)
+  if (!agentList.some(row => row.id !== 'main')) return
+  const roster = await $.agent.list().catch(() => [] as AgentInfo[])
+  const info = new Map(roster.map(one => [one.id, one]))
+  const live = new Set(roster.filter(one => !isFinishedAgentStatus(one.status)).map(one => one.id))
+  const stale = (row: AgentRow) => row.id !== 'main' && !live.has(row.id) && now - row.lastAt > config.finishedTtlMs
+  const dropped = agentList.filter(stale).length
+  const changed = dropped > 0 || agentList.some(row => enrich(row, info.get(row.id)) !== row)
+  if (!changed) return
+  let gone = 0
+  await update($, agents, all => {
+    gone = all.filter(stale).length
+    return all.filter(row => !stale(row)).map(row => enrich(row, info.get(row.id)))
+  })
+  if (gone > 0) await update($, tally, base => addTally(base, { ...EMPTY_TALLY, agents: gone }))
+}
+
+/** One poll: read new output, notice exits, drop rows past their time. */
+async function poll($: EngineInterface) {
+  const now = await $.clock.now()
+  const { seen, gone } = await scanJobs($, await read($, jobs), now)
 
   if (seen.size > 0) {
     await update($, jobs, all =>
@@ -223,23 +298,24 @@ async function poll($: EngineInterface) {
   }
   for (const { id, status } of gone) await endJob($, id, status)
 
-  // Finished rows leave after a while instead of staying for good.
+  // Finished rows leave after a while; the tally keeps their count.
   const ttl = config.finishedTtlMs
   const current = await read($, jobs)
-  if (current.some(job => isDone(job) && now - (job.endedAt ?? now) > ttl)) {
-    await update($, jobs, all => all.filter(job => !isDone(job) || now - (job.endedAt ?? now) <= ttl))
+  const expired = (job: Job) => isDone(job) && now - (job.endedAt ?? now) > ttl
+  if (current.some(expired)) {
+    let left: Job[] = []
+    await update($, jobs, all => {
+      left = all.filter(expired)
+      return all.filter(job => !expired(job))
+    })
+    await update($, tally, base => tallyOf(base, left, 0))
   }
-  const agentList = await read($, agents)
-  if (agentList.some(row => row.id !== 'main' && now - row.lastAt > ttl)) {
-    const roster = await $.agent.list().catch(() => [])
-    const live = new Set(roster.filter(one => one.status === 'running').map(one => one.id))
-    const stale = (row: AgentRow) => row.id !== 'main' && !live.has(row.id) && now - row.lastAt > ttl
-    if (agentList.some(stale)) await update($, agents, all => all.filter(row => !stale(row)))
-  }
+  await sweepAgents($, now)
 
-  // Elapsed times move even when nothing was written: the pane alone reads
+  // Elapsed times move even when nothing was written: the pane and band read
   // `tick`, so the transcript's rows are not redrawn for it.
-  if (current.some(job => job.status === 'running')) await update($, tick, n => (n ?? 0) + 1)
+  const busy = current.some(job => job.status === 'running')
+  if (busy || (await read($, agents)).some(row => row.id !== 'main')) await update($, tick, n => (n ?? 0) + 1)
   await showStatus($)
 }
 
@@ -248,23 +324,87 @@ async function addJob($: EngineInterface, job: Omit<Job, 'startedAt' | 'updatedA
   const now = await $.clock.now()
   const full: Job = { ...job, startedAt: now, updatedAt: now, status: 'running', bytes: 0, failures: 0, oks: 0, lastLine: '' }
   if (full.path) tasksDir ||= tasksDirOf(full.path)
-  await update($, jobs, all => [...all.filter(one => one.id !== full.id), full].slice(-KEEP_JOBS))
+  // Over the cap the oldest finished rows leave first, counted in the tally.
+  let evicted: Job[] = []
+  await update($, jobs, all => {
+    const list = [...all.filter(one => one.id !== full.id), full]
+    const over = list.length - KEEP_JOBS
+    if (over <= 0) return list
+    const done = list.filter(isDone).sort((a, b) => (a.endedAt ?? 0) - (b.endedAt ?? 0))
+    evicted = done.slice(0, over)
+    const out = new Set(evicted.map(job => job.id))
+    return list.filter(job => !out.has(job.id)).slice(-KEEP_JOBS)
+  })
+  if (evicted.length > 0) await update($, tally, base => tallyOf(base, evicted, 0))
   await showStatus($)
 }
 
-/** The one-line reading of a job, as the pane and the transcript row draw it. */
-const summaryOf = (job: Job, now: number) => {
-  const end = job.endedAt ?? now
-  const stale = job.status === 'running' && job.path !== '' && now - job.updatedAt > config.staleMs
-  return [
-    job.progress ? `${job.progress}` : '',
-    job.failures > 0 ? `not ok ×${job.failures}` : '',
-    isDone(job) ? outcomeOf(job) : '',
-    elapsed(end - job.startedAt),
-    stale ? `(quiet ${elapsed(now - job.updatedAt)})` : '',
-  ]
-    .filter(part => part !== '')
-    .join('  ')
+async function openPane($: EngineInterface) {
+  await $.ui.open({ id: PANE, title: 'Background & agents', columns: PANE_COLUMNS })
+  await update($, paneOpen, () => true)
+}
+
+async function closePane($: EngineInterface) {
+  await $.ui.close({ id: PANE })
+  await update($, paneOpen, () => false)
+}
+
+/** What the band and the pane draw from, read in one go. */
+async function snapshot($: EngineInterface, viewingAgent?: string): Promise<Snapshot> {
+  const [jobList, agentList, roster, now, base, viewState, open] = await Promise.all([
+    read($, jobs),
+    read($, agents),
+    $.agent.list().catch(() => [] as AgentInfo[]),
+    $.clock.now(),
+    read($, tally),
+    read($, view),
+    read($, paneOpen),
+    read($, tick),
+  ])
+  const info = new Map(roster.map(one => [one.id, one]))
+  const doneAgents = agentList.filter(row => row.id !== 'main' && isFinishedAgentStatus(info.get(row.id)?.status))
+  return {
+    jobs: jobList,
+    agents: agentList,
+    roster: info,
+    totals: totalsOf(base, jobList, doneAgents),
+    view: viewState,
+    viewingAgent,
+    paneOpen: open,
+    now,
+    staleMs: config.staleMs,
+    recentFailMs: RECENT_FAIL_MS,
+  }
+}
+
+const toggleIn = (list: readonly string[], id: string) =>
+  list.includes(id) ? list.filter(one => one !== id) : [...list, id]
+
+function actionsOf($: EngineInterface): Actions {
+  const report = (what: string) => (error: unknown) => $.ui.log(`bg-watch: ${what} failed: ${String(error)}`)
+  const viewOf = async (target: { agentId?: string }) => {
+    const ran = await $.ui.view(target)
+    if ('deny' in ran && ran.deny !== undefined) $.ui.toast(`bg-watch: ${ran.deny}`)
+  }
+  return {
+    togglePane: () => void read($, paneOpen).then(open => (open ? closePane($) : openPane($))).catch(report('toggling the pane')),
+    toggle: id => {
+      const isSection = id === 'jobs' || id === 'jobs-done' || id === 'agents' || id === 'agents-done'
+      void update($, view, v =>
+        isSection ? { ...v, collapsed: toggleIn(v.collapsed, id) } : { ...v, expanded: toggleIn(v.expanded, id) },
+      ).catch(report('toggling a row'))
+    },
+    stop: id => void stopJob($, id).catch(report('stopping a job')),
+    copy: (text, press) =>
+      void $.ui
+        .copy({ text, surface: press.surface })
+        .then(() => $.ui.toast('bg-watch: copied the output path'))
+        .catch(report('copying')),
+    viewAgent: id => void viewOf({ agentId: id }).catch(report('opening the transcript')),
+    back: () => void viewOf({}).catch(report('going back')),
+    clear: () => void clearFinished($).catch(report('clearing')),
+    close: () => void closePane($).catch(report('closing the pane')),
+  }
 }
 
 export const register: Register = (on, options) => {
@@ -275,6 +415,9 @@ export const register: Register = (on, options) => {
       name: 'bg-watch',
       description: 'Open the background jobs & subagents pane; "close" closes it, "clear" drops finished rows',
     })
+    // A reload keeps the pane up: learn whether it is.
+    const panes = await $.ui.panes().catch(() => [])
+    await update($, paneOpen, () => panes.some(pane => pane.id === PANE))
 
     let busy = false
     $.clock.every(POLL_MS, async () => {
@@ -294,18 +437,23 @@ export const register: Register = (on, options) => {
 
   on('command.run', { command: 'bg-watch' }, async ($, e) => {
     if (/\bclear\b/.test(e.args)) {
-      await update($, jobs, all => all.filter(job => job.status === 'running'))
-      await update($, agents, all => all.filter(row => row.id === 'main'))
-      await showStatus($)
+      await clearFinished($)
       return { text: 'bg-watch: finished jobs and agent rows cleared.' }
     }
     if (/\bclose\b/.test(e.args)) {
-      await $.ui.close({ id: PANE })
-      return { text: 'bg-watch pane closed (status line keeps running).' }
+      await closePane($)
+      return { text: 'bg-watch pane closed.' }
     }
-    await $.ui.open({ id: PANE, title: 'Background & agents' })
+    await openPane($)
     return { text: 'bg-watch pane opened.' }
   })
+
+  // The person's close mark, or an unload: the band's [open] follows.
+  on('ui.close', async ($, e, next) => {
+    const done = await next(e)
+    if (e.id === PANE) await update($, paneOpen, () => false)
+    return done
+  }).catch(($, e, next) => next(e))
 
   // A background Bash call, the main agent's or a subagent's.
   on('tool.call', { tool: 'Bash' }, async ($, e, next) => {
@@ -399,10 +547,12 @@ export const register: Register = (on, options) => {
     const effort = e.effort === undefined ? '-' : String(e.effort)
     void $.clock
       .now()
-      .then(now =>
-        update($, agents, all => {
+      .then(async now => {
+        let evicted = 0
+        await update($, agents, all => {
           const old = all.find(row => row.id === id)
           const row: AgentRow = {
+            ...old,
             id,
             model: e.model,
             effort,
@@ -410,9 +560,12 @@ export const register: Register = (on, options) => {
             firstAt: old?.firstAt ?? now,
             lastAt: now,
           }
-          return [...all.filter(one => one.id !== id), row].slice(-KEEP_AGENTS)
-        }),
-      )
+          const list = [...all.filter(one => one.id !== id), row]
+          evicted = list.slice(0, Math.max(0, list.length - KEEP_AGENTS)).filter(one => one.id !== 'main').length
+          return list.slice(-KEEP_AGENTS)
+        })
+        if (evicted > 0) await update($, tally, base => addTally(base, { ...EMPTY_TALLY, agents: evicted }))
+      })
       .catch(error => $.ui.log(`bg-watch: recording a step failed: ${String(error)}`))
     return yield* next(e)
   })
@@ -431,82 +584,27 @@ export const register: Register = (on, options) => {
         {row}
         <Text dimColor>
           {'  ⎿ '}
-          {mark(job.status)} {summaryOf(job, now)}
+          {mark(job.status)} {jobFigures(job, now, config.staleMs).join('  ')}
           {job.status === 'running' && job.lastLine !== '' ? `  ${clip(job.lastLine, 80)}` : ''}
         </Text>
       </Box>
     )
   })
 
-  on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
-    const { Box, Text, Button } = $.ui.resolve(e)
-    const [jobList, agentList, roster, now] = await Promise.all([
-      read($, jobs),
-      read($, agents),
-      $.agent.list().catch(() => []),
-      $.clock.now(),
-      read($, tick),
-    ])
-    const info = new Map(roster.map(one => [one.id, one]))
-    const subagents = agentList.filter(row => row.id !== 'main')
-    const main = agentList.find(row => row.id === 'main')
-    const room = Math.max(4, (e.viewport?.rows ?? 30) - 8)
-    // Running jobs first, then the newest finished ones.
-    const ordered = [...jobList.filter(job => !isDone(job)), ...jobList.filter(isDone).reverse()]
-    const jobRows = ordered.slice(0, Math.ceil(room / 3))
-    const agentRows = subagents.slice(-Math.max(2, room - jobRows.length * 2))
+  // The band above the prompt: a one-line summary; a press opens or closes the pane.
+  on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
+    if (!config.band || e.props.hasSurvey) return next(e)
+    const row = bandRow($.ui.resolve(e), await snapshot($), e.props.bodyColumns, actionsOf($))
+    return row ?? next(e)
+  })
 
-    return (
-      <Box flexDirection="column">
-        <Text bold>Background jobs</Text>
-        {jobRows.length === 0 && <Text dimColor>  none</Text>}
-        {jobRows.map(job => {
-          const color =
-            job.status === 'completed' ? 'green' : job.status === 'running' || mark(job.status) === '■' ? undefined : 'red'
-          return (
-            <Box flexDirection="column">
-              <Box flexDirection="row">
-                <Text color={color} dimColor={mark(job.status) === '■'}>
-                  {mark(job.status)} {clip(titleOf(job), 48)}  {summaryOf(job, now)}
-                  {job.status === 'running' && !job.path && job.kind === 'bash' ? '  (no output file)' : ''}
-                </Text>
-                {job.status === 'running' && (
-                  <Button key={`stop-${job.id}`} label="stop" dimColor onPress={() => stopJob($, job.id)} />
-                )}
-              </Box>
-              {job.status === 'running' && job.lastLine !== '' && (
-                <Text dimColor>    {clip(job.lastLine, 100)}</Text>
-              )}
-            </Box>
-          )
-        })}
-        <Text> </Text>
-        <Text bold>
-          Subagents (actual model@effort)
-          {main ? `   main: ${shortModel(main.model)}@${main.effort}` : ''}
-        </Text>
-        {agentRows.length === 0 && <Text dimColor>  none</Text>}
-        {agentRows.map(row => {
-          const one = info.get(row.id)
-          const status = one?.status ?? '?'
-          const out = (one?.usage ?? []).reduce((n, u) => n + u.output_tokens, 0)
-          const cost = one?.cost?.usd
-          return (
-            <Text dimColor={status !== 'running'}>
-              {status === 'running' ? '▶' : '·'} {clip(one?.type ?? row.id, 22).padEnd(22)}{' '}
-              {clip(one?.description ?? '', 28).padEnd(28)} {shortModel(row.model)}@{row.effort}
-              {`  ${row.steps} steps  ${elapsed(row.lastAt - row.firstAt)}`}
-              {out > 0 ? `  ${tokens(out)} out` : ''}
-              {cost !== undefined ? `  $${cost.toFixed(2)}` : ''}
-            </Text>
-          )
-        })}
-      </Box>
-    )
+  on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
+    const s = await snapshot($, e.props.view.agentId)
+    return paneBody($.ui.resolve(e), s, e.props.bodyColumns, actionsOf($))
   })
 }
 
-/** One status-line entry for running jobs, cleared when none run. */
+/** One status-line entry for running jobs, cleared when none run; off unless asked for. */
 async function showStatus($: EngineInterface) {
   if (!config.statusLine) {
     $.ui.status(undefined)
@@ -515,13 +613,13 @@ async function showStatus($: EngineInterface) {
   const list = await read($, jobs)
   const now = await $.clock.now()
   const running = list.filter(job => job.status === 'running')
-  if (running.length === 0) {
+  const first = focusJob(list)
+  if (!first) {
     $.ui.status(undefined)
     return
   }
-  const first = running[0]!
   const more = running.length > 1 ? ` +${running.length - 1}` : ''
   $.ui.status(
-    `▶ ${clip(titleOf(first), 30)}${first.progress ? ` ${first.progress}` : ''} · ${elapsed(now - first.startedAt)}${more}`,
+    `▶ ${clip(nameOf(first), 30)}${first.progress ? ` ${first.progress}` : ''} · ${elapsed(now - first.startedAt)}${more}`,
   )
 }

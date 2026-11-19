@@ -1,7 +1,33 @@
 /** Pure text parsing for bg-watch: no `$`, so tests call it directly. */
 
-export const clip = (text: string, max: number) =>
-  text.length > max ? `${text.slice(0, max - 1)}…` : text
+/** East Asian wide and fullwidth characters, and emoji: two cells in a terminal. */
+const WIDE = /[\u1100-\u115f\u2e80-\u303e\u3041-\u33ff\u3400-\u4dbf\u4e00-\u9fff\ua000-\ua4cf\uac00-\ud7a3\uf900-\ufaff\ufe30-\ufe4f\uff00-\uff60\uffe0-\uffe6]|[\u{1f300}-\u{1f64f}\u{1f900}-\u{1f9ff}\u{20000}-\u{3fffd}]/u
+
+const cellOf = (ch: string) => (WIDE.test(ch) ? 2 : 1)
+
+/** How many terminal cells the text takes. */
+export const cells = (text: string) => {
+  let n = 0
+  for (const ch of text) n += cellOf(ch)
+  return n
+}
+
+/** Text without ANSI escapes and control characters, which take no cells or move the cursor. */
+export const plain = (text: string) =>
+  text.replace(/\u001b\[[0-9;?]*[ -/]*[@-~]|\u001b\][^\u0007]*(?:\u0007|\u001b\\)/g, '').replace(/[\u0000-\u001f\u007f]/g, '')
+
+/** Text cut to `max` cells, ending in `…` when cut. */
+export const clip = (text: string, max: number) => {
+  if (cells(text) <= max) return text
+  let out = ''
+  let used = 0
+  for (const ch of text) {
+    if (used + cellOf(ch) > max - 1) break
+    out += ch
+    used += cellOf(ch)
+  }
+  return `${out}…`
+}
 
 export const elapsed = (ms: number) => {
   const s = Math.max(0, Math.round(ms / 1000))
@@ -113,6 +139,6 @@ export const readPiece = (text: string): Reading => {
     plan: plan === undefined ? undefined : Number(plan),
     progress: found.progress,
     summaryFailures: found.failures,
-    lastLine: clip(lastLine.trim(), 160),
+    lastLine: clip(plain(lastLine).trim(), 160),
   }
 }

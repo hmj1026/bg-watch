@@ -1,14 +1,14 @@
 {
   "name": "bg-watch",
-  "version": "0.3.0",
-  "description": "Live progress of background Bash commands, Monitors and Workflows, and the actual model@effort, tokens and cost of each subagent, in a pane, the transcript and the status line",
+  "version": "0.4.0",
+  "description": "Live progress of background Bash commands, Monitors and Workflows, and the actual model@effort, tokens and cost of each subagent, in a clickable band above the prompt, a pane and the transcript",
   "types": "./types/index.d.ts",
   "userConfig": {
     "finishedTtlSec": {
       "type": "number",
       "title": "Keep finished rows (seconds)",
-      "description": "How long a finished job or idle subagent row stays in the pane before it leaves on its own",
-      "default": 180
+      "description": "How long a finished job or idle subagent row stays listed (folded under \"done\") before it leaves; the session totals keep counting it",
+      "default": 1800
     },
     "quietCheckSec": {
       "type": "number",
@@ -31,7 +31,13 @@
     "statusLine": {
       "type": "boolean",
       "title": "Status line",
-      "description": "Show the running jobs in the status line",
+      "description": "Also show the running jobs in the status line (the band above the prompt replaces it)",
+      "default": false
+    },
+    "band": {
+      "type": "boolean",
+      "title": "Band above the prompt",
+      "description": "A one-line, clickable summary above the prompt that opens and closes the pane",
       "default": true
     }
   }

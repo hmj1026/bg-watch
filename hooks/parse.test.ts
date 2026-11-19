@@ -54,3 +54,7 @@ test('token counts read short', () => {
   expect(tokens(12_345)).toBe('12.3k')
   expect(tokens(2_500_000)).toBe('2.5M')
 })
+
+test('the last line drops ANSI color codes and control characters', () => {
+  expect(readPiece('\u001b[32mPASS\u001b[0m src/a.test.ts\r\n').lastLine).toBe('PASS src/a.test.ts')
+})
